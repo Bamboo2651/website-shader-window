@@ -18,6 +18,7 @@ const vertSrc = `
 `;
 
 const fragSrc = `
+#extension GL_OES_standard_derivatives : enable
     precision mediump float;
     uniform sampler2D uTexture;
     uniform vec2 uBoxPos;
@@ -26,17 +27,103 @@ const fragSrc = `
     uniform float uDh;
     uniform float uDx;
     uniform float uDy;
+    uniform vec2 uMouse;
     varying vec2 vTexCoord;
+
+    vec2 getDistortedUv(vec2 uv, vec2 direction, float factor) {
+        return uv - direction * factor;
+    }
+
+    struct DistortedLens {
+        vec2 uv_R;
+        vec2 uv_G;
+        vec2 uv_B;
+        float focusSdf;
+        float speherSdf;
+        float inside;
+    };
+
+    DistortedLens getLensDistortion(
+        vec2 p,
+        vec2 uv,
+        vec2 sphereCenter,
+        float sphereRadius,
+        float focusFactor,
+        float chromaticAberrationFactor,
+        vec2 boxSize
+    ) {
+        vec2 distortionDirection = normalize(p - sphereCenter);
+        float focusRadius = sphereRadius * focusFactor;
+        float focusStrength = sphereRadius / 5000.0;
+        vec2 df = abs(p - sphereCenter) - boxSize * 0.5 * focusFactor;
+        float focusSdf = length(max(df, 0.0)) + min(max(df.x, df.y), 0.0);
+        vec2 d = abs(p - sphereCenter) - boxSize * 0.5;
+        float speherSdf = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+        float inside = clamp(-speherSdf / fwidth(speherSdf), 0., 1.);
+
+        float magnifierFactor = focusSdf / (sphereRadius - focusRadius);
+        float mFactor = clamp(magnifierFactor * inside, 0., 1.);
+        mFactor = pow(mFactor, 4.0);
+
+        vec3 distortionFactors = vec3(
+            mFactor * focusStrength * (1.0 + chromaticAberrationFactor),
+            mFactor * focusStrength,
+            mFactor * focusStrength * (1.0 - chromaticAberrationFactor)
+        );
+
+        vec2 uv_R = getDistortedUv(uv, distortionDirection, distortionFactors.r);
+        vec2 uv_G = getDistortedUv(uv, distortionDirection, distortionFactors.g);
+        vec2 uv_B = getDistortedUv(uv, distortionDirection, distortionFactors.g);
+
+        return DistortedLens(uv_R, uv_G, uv_B, focusSdf, speherSdf, inside);
+    }
+
+    vec2 zoomUV(vec2 uv, vec2 center, float zoom) {
+        float zoomFactor = 1.0 / zoom;
+        vec2 centeredUV = uv - center;
+        centeredUV *= zoomFactor;
+        return centeredUV + center;
+    }
+
+    vec2 toVideoUV(vec2 pixelPos) {
+        float u = (pixelPos.x - uDx) / uDw;
+        float v = (pixelPos.y - uDy) / uDh;
+        return vec2(u, v);
+    }
 
     void main() {
         // boxのピクセル座標
-        vec2 pixelPos = uBoxPos + vTexCoord * uBoxSize;
+        vec2 p = uBoxPos + vTexCoord * uBoxSize;
 
-        // 動画のUV座標に変換（2DのdrawClippedと同じ計算）
-        float u = (pixelPos.x - uDx) / uDw;
-        float v = (pixelPos.y - uDy) / uDh;
+        // 通常のくりぬきUV
+        vec2 vUv = toVideoUV(p);
 
-        gl_FragColor = texture2D(uTexture, vec2(u,v));
+        // マウス座標（box内の相対座標）
+        vec2 sphereCenter = uBoxPos + uBoxSize / 2.0;
+
+        float sphereRadius = uBoxSize.y * 0.6;
+        float focusFactor = 0.7;
+        float chromaticAberrationFactor = 0.2;
+        float zoom = 1.0;
+
+        vec2 sphereCenterUv = toVideoUV(sphereCenter);
+        vec2 zoomedUv = zoomUV(vUv, sphereCenterUv, zoom);
+
+        DistortedLens distortion = getLensDistortion(
+            p, zoomedUv, sphereCenter, sphereRadius, focusFactor, chromaticAberrationFactor, uBoxSize
+        );
+        
+
+        float r = texture2D(uTexture, distortion.uv_R).r;
+        float g = texture2D(uTexture, distortion.uv_G).g;
+        float b = texture2D(uTexture, distortion.uv_B).b;
+        vec3 imageDistorted = vec3(r, g, b);
+
+        vec3 image = texture2D(uTexture, vUv).rgb;
+        image = mix(image, imageDistorted, distortion.inside);
+        
+
+        gl_FragColor = vec4(image, 1.0);
     }
 `;
 
@@ -50,6 +137,10 @@ function createShader(gl, type, source) {
 function createProgram(gl, vertSrc, fragSrc) {
     const vert = createShader(gl, gl.VERTEX_SHADER, vertSrc);
     const frag = createShader(gl, gl.FRAGMENT_SHADER, fragSrc);
+
+        // エラー確認
+    console.log("vert error:", gl.getShaderInfoLog(vert));
+    console.log("frag error:", gl.getShaderInfoLog(frag));
     const program = gl.createProgram();
     gl.attachShader(program, vert);
     gl.attachShader(program, frag);
@@ -59,6 +150,7 @@ function createProgram(gl, vertSrc, fragSrc) {
 
 function initWebGL(canvas) {
     const gl = canvas.getContext("webgl");
+    const ext = gl.getExtension("OES_standard_derivatives");
     const program = createProgram(gl, vertSrc, fragSrc);
     gl.useProgram(program);
 
@@ -86,14 +178,15 @@ function initWebGL(canvas) {
     const texLoc = gl.getUniformLocation(program, "uTexture");
     gl.uniform1i(texLoc, 0);
 
-    const uBoxPos = gl.getUniformLocation(program, "uBoxPos");
+    const uBoxPos  = gl.getUniformLocation(program, "uBoxPos");
     const uBoxSize = gl.getUniformLocation(program, "uBoxSize");
-    const uDw = gl.getUniformLocation(program, "uDw");
-    const uDh = gl.getUniformLocation(program, "uDh");
-    const uDx = gl.getUniformLocation(program, "uDx");
-    const uDy = gl.getUniformLocation(program, "uDy");
+    const uDw      = gl.getUniformLocation(program, "uDw");
+    const uDh      = gl.getUniformLocation(program, "uDh");
+    const uDx      = gl.getUniformLocation(program, "uDx");
+    const uDy      = gl.getUniformLocation(program, "uDy");
+    const uMouse   = gl.getUniformLocation(program, "uMouse");
 
-    return { gl, texture, program, uBoxPos, uBoxSize, uDw, uDh, uDx, uDy };
+    return { gl, texture, program, uBoxPos, uBoxSize, uDw, uDh, uDx, uDy, uMouse };
 }
 
 document.addEventListener("mousemove", e => {
@@ -104,7 +197,7 @@ document.addEventListener("mousemove", e => {
         globalHud.innerHTML = `X: ${mouseX}px <br/> Y: ${mouseY}px`;
     }
 
-    globalHud.style.transform = `translate3d(${mouseX + 2}px, ${mouseY + 2}px, 0)`
+    globalHud.style.transform = `translate3d(${mouseX + 2}px, ${mouseY + 2}px, 0)`;
 });
 
 function updateCoords(mask) {
@@ -168,7 +261,7 @@ function calcVideoLayout() {
 }
 
 function drawWebGL(cache, video, rect) {
-    const { gl, texture, uBoxPos, uBoxSize, uDw, uDh, uDx, uDy } = cache;
+    const { gl, texture, uBoxPos, uBoxSize, uDw, uDh, uDx, uDy, uMouse } = cache;
 
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
@@ -181,6 +274,7 @@ function drawWebGL(cache, video, rect) {
     gl.uniform1f(uDh, dh);
     gl.uniform1f(uDx, dx);
     gl.uniform1f(uDy, dy);
+    gl.uniform2f(uMouse, mouseX, mouseY);
 
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -198,7 +292,7 @@ function initMasks() {
             dragging: false,
             ox: 0,
             oy: 0,
-            isWebGL: i === 0
+            isWebGL: i === 5 //box6
         });
 
         mask.style.left = "0";
